@@ -19,7 +19,7 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Bluetooth Demo',
+      title: 'Bluetooth V3',
       theme: ThemeData(primarySwatch: Colors.blue),
       home: const BluetoothDeviceListScreen(),
     );
