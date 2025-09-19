@@ -22,16 +22,22 @@ class _ConnectedDeviceScreenState extends State<ConnectedDeviceScreen> {
   final List<FlSpot> _dataAA21 = [];
   final List<FlSpot> _dataAA03 = [];
 
+  final List<double> _ecgWindow = []; // buffer for moving average
+
   double _xAA21 = 0;
   double _xAA03 = 0;
 
   bool _loading = true;
 
+  // sweep limits
+  static const int _maxXAA21 = 1000; // ECG
+  static const int _maxXAA03 = 100;  // PPG
+
   @override
   void initState() {
     super.initState();
 
-    // Auto return to device list if disconnected
+    // Auto return if disconnected
     widget.device.connectionState.listen((state) {
       if (state == BluetoothConnectionState.disconnected && mounted) {
         Navigator.of(context).popUntil((route) => route.isFirst);
@@ -48,7 +54,6 @@ class _ConnectedDeviceScreenState extends State<ConnectedDeviceScreen> {
     super.dispose();
   }
 
-  /// Converts big-endian bytes to int
   int _bigEndianToInt(List<int> bytes, {bool signed = false}) {
     if (bytes.isEmpty) return 0;
     int result = 0;
@@ -65,64 +70,71 @@ class _ConnectedDeviceScreenState extends State<ConnectedDeviceScreen> {
     return result;
   }
 
+  double _applyEcgMovingAverage(double newValue) {
+    // keep last 3 values
+    _ecgWindow.add(newValue);
+    if (_ecgWindow.length > 3) {
+      _ecgWindow.removeAt(0);
+    }
+
+    // compute average
+    double sum = 0;
+    for (final v in _ecgWindow) {
+      sum += v;
+    }
+    return sum / _ecgWindow.length;
+  }
+
   Future<void> _subscribeToCharacteristics() async {
     try {
       final services = await widget.device.discoverServices();
 
-      // ---- Subscribe to AA21 ----
+      // --- ECG (AA21) ---
       final serviceAA20 = services.firstWhere(
         (s) => s.uuid.toString().toLowerCase().contains("0000aa20"),
-        orElse: () => throw Exception("Service 0000aa20 not found"),
       );
-
       final charAA21 = serviceAA20.characteristics.firstWhere(
         (c) => c.uuid.toString().toLowerCase().contains("0000aa21"),
-        orElse: () => throw Exception("Characteristic 0000aa21 not found"),
       );
 
       await charAA21.setNotifyValue(true);
       _notifySubAA21 = charAA21.onValueReceived.listen((value) {
         if (value.isNotEmpty) {
-          final number = _bigEndianToInt(value, signed: false);
-
-          logger.i(
-            "[AA21] HEX=${value.map((b) => b.toRadixString(16).padLeft(2, '0')).join()} -> $number",
-          );
+          final raw = _bigEndianToInt(value);
+          final filtered = _applyEcgMovingAverage(raw.toDouble());
 
           setState(() {
             _xAA21 += 1;
-            _dataAA21.add(FlSpot(_xAA21, number.toDouble()));
-            if (_dataAA21.length > 500) _dataAA21.removeAt(0);
+            if (_xAA21 > _maxXAA21) {
+              _xAA21 = 0;
+              _dataAA21.clear();
+            }
+            _dataAA21.add(FlSpot(_xAA21, filtered));
           });
         }
       });
 
-      // ---- Subscribe to AA03 ----
+      // --- PPG (AA03) ---
       final serviceAA00 = services.firstWhere(
         (s) => s.uuid.toString().toLowerCase().contains("0000aa00"),
-        orElse: () => throw Exception("Service 0000aa00 not found"),
       );
-
       final charAA03 = serviceAA00.characteristics.firstWhere(
         (c) => c.uuid.toString().toLowerCase().contains("0000aa03"),
-        orElse: () => throw Exception("Characteristic 0000aa03 not found"),
       );
 
       await charAA03.setNotifyValue(true);
       _notifySubAA03 = charAA03.onValueReceived.listen((value) {
         if (value.isNotEmpty) {
-          final number = _bigEndianToInt(value, signed: false);
-          final scaledNumber = number * 0.002;
-
-          logger.i(
-            "[AA03] HEX=${value.map((b) => b.toRadixString(16).padLeft(2, '0')).join()} "
-            "-> raw: $number, scaled: $scaledNumber",
-          );
+          final number = _bigEndianToInt(value);
+          final scaled = number * 0.002;
 
           setState(() {
             _xAA03 += 1;
-            _dataAA03.add(FlSpot(_xAA03, scaledNumber.toDouble()));
-            if (_dataAA03.length > 50) _dataAA03.removeAt(0);
+            if (_xAA03 > _maxXAA03) {
+              _xAA03 = 0;
+              _dataAA03.clear();
+            }
+            _dataAA03.add(FlSpot(_xAA03, scaled));
           });
         }
       });
@@ -130,36 +142,24 @@ class _ConnectedDeviceScreenState extends State<ConnectedDeviceScreen> {
       setState(() => _loading = false);
     } catch (e) {
       logger.e("Error subscribing: $e");
-      if (!mounted) return;
       setState(() => _loading = false);
     }
   }
 
   Future<void> _disconnectDevice() async {
     try {
-      logger.i("Disconnecting device...");
-
       await _notifySubAA21?.cancel();
       await _notifySubAA03?.cancel();
-
       await widget.device.disconnect();
-
-      logger.i("Device disconnected.");
-    } catch (e) {
-      logger.w("Error disconnecting: $e");
-    }
+    } catch (_) {}
   }
 
-  Widget _buildGraph(List<FlSpot> data, String title, Color color) {
+  Widget _buildGraph(List<FlSpot> data, String title, double maxX) {
     final graphHeight = MediaQuery.of(context).size.height / 4;
+    final FlSpot? latest = data.isNotEmpty ? data.last : null;
 
-    // Safe dynamic Y axis
-    final double minY = data.isNotEmpty
-        ? data.map((e) => e.y).reduce((a, b) => a < b ? a : b)
-        : 0.0;
-    final double maxY = data.isNotEmpty
-        ? data.map((e) => e.y).reduce((a, b) => a > b ? a : b)
-        : 100.0;
+    final double minY = data.isNotEmpty ? data.map((e) => e.y).reduce((a, b) => a < b ? a : b) - 10 : 0;
+    final double maxY = data.isNotEmpty ? data.map((e) => e.y).reduce((a, b) => a > b ? a : b) + 10 : 100;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -170,19 +170,38 @@ class _ConnectedDeviceScreenState extends State<ConnectedDeviceScreen> {
           height: graphHeight,
           child: LineChart(
             LineChartData(
+              minX: 0,
+              maxX: maxX.toDouble(),
               minY: minY,
               maxY: maxY,
               titlesData: FlTitlesData(show: false),
               gridData: FlGridData(show: true),
               borderData: FlBorderData(show: true),
               lineBarsData: [
+                // Full waveform
                 LineChartBarData(
                   spots: data,
-                  isCurved: true,
-                  color: color,
+                  isCurved: false,
+                  color: Colors.blue,
                   barWidth: 2,
                   dotData: FlDotData(show: false),
                 ),
+                // Green moving dot
+                if (latest != null)
+                  LineChartBarData(
+                    spots: [latest],
+                    isCurved: false,
+                    color: Colors.green,
+                    barWidth: 0,
+                    dotData: FlDotData(
+                      show: true,
+                      getDotPainter: (spot, _, __, ___) => FlDotCirclePainter(
+                        radius: 5,
+                        color: Colors.green,
+                        strokeWidth: 0,
+                      ),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -210,8 +229,8 @@ class _ConnectedDeviceScreenState extends State<ConnectedDeviceScreen> {
               padding: const EdgeInsets.all(16.0),
               child: Column(
                 children: [
-                  _buildGraph(_dataAA21, "ECG (0xAA21)", Colors.red),
-                  _buildGraph(_dataAA03, "PPG (0xAA03)", Colors.green),
+                  _buildGraph(_dataAA21, "ECG (0xAA21, 3-pt MA)", _maxXAA21.toDouble()),
+                  _buildGraph(_dataAA03, "PPG (0xAA03)", _maxXAA03.toDouble()),
                 ],
               ),
             ),
